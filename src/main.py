@@ -27,7 +27,7 @@ def main():
     # 定義要測試的演算法
     algorithms = {
         "FIFO": FIFO,
-        # "Optimal": Optimal,
+        "Optimal": Optimal,
         "ReferenceBits": ReferenceBits,
         "ARC": ARC,
     }

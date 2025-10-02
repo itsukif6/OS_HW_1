@@ -51,7 +51,7 @@ class FIFO(PageReplacementAlgorithm):
 
         for page, is_write in ref_string:
             if page not in memory:
-                # 分頁不在記憶體 -> Page Fault
+                # 分頁不在記憶體 => Page Fault
                 self.faults += 1
                 self.interrupts += 1
 
@@ -66,6 +66,7 @@ class FIFO(PageReplacementAlgorithm):
                     # 如果被踢掉的分頁是髒的, 要寫回磁碟
                     if victim in dirty and dirty[victim]:
                         self.writes += 1
+                        self.interrupts += 1
 
                     memory.remove(victim)
                     memory.append(page)
@@ -76,7 +77,7 @@ class FIFO(PageReplacementAlgorithm):
 
                 dirty[page] = is_write
             else:
-                # 分頁在記憶體中 -> Page Hit
+                # 分頁在記憶體中 => Page Hit
                 if is_write:
                     dirty[page] = True
         print(
@@ -86,14 +87,24 @@ class FIFO(PageReplacementAlgorithm):
 
 
 class Optimal(PageReplacementAlgorithm):
-    """Optimal algorithm"""
+    """Optimal algorithm (改進版，預先計算未來出現位置)"""
 
     def run(self, ref_string):
         self.reset()
         memory = []
         dirty = {}
 
+        # 預先建立 future_positions: 每個 page 的出現索引列表
+        future_positions = {}
+        for i, (page, _) in enumerate(ref_string):
+            if page not in future_positions:
+                future_positions[page] = []
+            future_positions[page].append(i)
+
         for i, (page, is_write) in enumerate(ref_string):
+            # 移除這次出現
+            future_positions[page].pop(0)
+
             if page not in memory:
                 self.faults += 1
                 self.interrupts += 1
@@ -102,14 +113,14 @@ class Optimal(PageReplacementAlgorithm):
                     memory.append(page)
                 else:
                     # 找出未來最久才會用到的分頁
-                    victim = self._find_victim(memory, ref_string, i)
+                    victim = self._find_victim(memory, future_positions)
 
                     if victim in dirty and dirty[victim]:
                         self.writes += 1
+                        self.interrupts += 1
 
                     memory.remove(victim)
                     memory.append(page)
-
                     if victim in dirty:
                         del dirty[victim]
 
@@ -117,38 +128,30 @@ class Optimal(PageReplacementAlgorithm):
             else:
                 if is_write:
                     dirty[page] = True
+
         print(
             f"    Faults: {self.faults}, Interrupts: {self.interrupts}, Writes: {self.writes}"
         )
         return self.faults, self.interrupts, self.writes
 
-    def _find_victim(self, memory, ref_string, current):
+    def _find_victim(self, memory, future_positions):
         """
-        找出最佳的犧牲者（未來最久才會用到的分頁)
-
-        參數:
-            memory: 目前記憶體中的分頁
-            ref_string: 完整的參考字串
-            current: 目前的位置
+        找出最佳的犧牲者 (未來最久才會用到的分頁)
         """
         max_dist = -1
         victim = memory[0]
 
         for page in memory:
-            # 找這個分頁下次會在什麼時候用到
-            found = False
-            for j in range(current + 1, len(ref_string)):
-                # ref_string[j] 是 (page, is_write) tuple
-                if ref_string[j][0] == page:
-                    if j > max_dist:
-                        max_dist = j
-                        victim = page
-                    found = True
-                    break
-
-            # 如果未來都不會用到, 就選這個
-            if not found:
+            if future_positions[page]:
+                # 下次出現的位置
+                next_use = future_positions[page][0]
+            else:
+                # 永遠不會再用到 → 直接選這個
                 return page
+
+            if next_use > max_dist:
+                max_dist = next_use
+                victim = page
 
         return victim
 
@@ -176,11 +179,12 @@ class ReferenceBits(PageReplacementAlgorithm):
                     memory.append(page)
                     bits[page] = 128  # 0b10000000 最左邊設1
                 else:
-                    # 找參考位元值最小的（最少被用到)
+                    # 找參考位元值最小的 (最少被用到)
                     victim = min(memory, key=lambda p: bits[p])
 
                     if victim in dirty and dirty[victim]:
                         self.writes += 1
+                        self.interrupts += 1
 
                     memory.remove(victim)
                     memory.append(page)
@@ -203,91 +207,153 @@ class ReferenceBits(PageReplacementAlgorithm):
 
 
 class ARC(PageReplacementAlgorithm):
-    """Adaptive Replacement Cache (ARC)"""
+    """
+    Adaptive Replacement Cache (ARC)
+    方法參考: https://www.usenix.org/legacy/events/fast03/tech/full_papers/megiddo/megiddo.pdf
+
+    T1:             list, 儲存「只被用過一次」且目前在 cache 的頁面 (recency)。
+    T2:             list, 儲存「被多次存取」且在 cache 的頁面 (frequency)。
+    B1:             list, ghost list, 只記錄從 T1 驅逐出去的 page id (不占 frame)。
+    B2:             list, ghost list, 只記錄從 T2 驅逐出去的 page id。
+    dirty:          dict, page => bool, 標示該頁面是否為髒 (需要寫回)。
+    self.p:         整數, ARC 的自適應參數, 用來調整 T1 與 T2 的相對大小 (範圍被限制在 [0, frames])。
+    replace(page):  內部函式, 負責根據 p 與 ghost hits 決定要從 T1 還是 T2 淘汰一個頁面, 並把被淘汰者放到對應的 ghost list (B1 或 B2)。
+    """
 
     def run(self, ref_string):
         self.reset()
 
-        # 四個集合
+        # 四個 lists
         T1, T2 = [], []  # 真正的快取頁面
         B1, B2 = [], []  # ghost lists (只存 page id)
 
         # dirty 紀錄
         dirty = {}
-        self.p = 0  # 動態調整參數
+        self.p = 0  # 動態調整參數, p = 0 表示初期偏向 T2 (T2 較重要)
 
         def replace(page):
-            """選擇一個頁面淘汰"""
+            """
+            選擇一個頁面淘汰
+            條件: T1 非空 且 (|T1| > p 或 (page 在 B2 且 |T1| == p))
+            """
+            # 當 T1 非空 且 (|T1| > p 或 (page 在 B2 且 |T1| == p))
             if T1 and ((len(T1) > self.p) or (page in B2 and len(T1) == self.p)):
                 victim = T1.pop(0)
-                B1.append(victim)
+                B1.append(victim)  # 移到 ghost list 最後
+                # 如果是 dirty page, 需要寫回
                 if victim in dirty and dirty[victim]:
                     self.writes += 1
+                    self.interrupts += 1
+                # 清除 dirty 狀態 (使用 pop 避免 KeyError)
                 dirty.pop(victim, None)
+
             elif T2:
                 victim = T2.pop(0)
-                B2.append(victim)
+                B2.append(victim)  # 移到 ghost list 最後
+                # 如果是 dirty page, 需要寫回
                 if victim in dirty and dirty[victim]:
                     self.writes += 1
+                    self.interrupts += 1
+                # 清除 dirty 狀態 (使用 pop 避免 KeyError)
                 dirty.pop(victim, None)
+
             else:
-                # 這個情況只會在初始化早期出現
+                # 這種情況理論上不應該發生 (T1 和 T2 都空了但還要 replace)
                 return
 
         for page, is_write in ref_string:
-            # 命中在 T1 或 T2
+            # Case 1: 命中在 T1 或 T2，表示命中的 page 經常被使用
             if page in T1 or page in T2:
+                # 真正的緩存命中，不計數 fault 和 interrupt (與其他算法一致)
                 if page in T1:
                     T1.remove(page)
-                    T2.append(page)  # 提升到 T2
+                    T2.append(page)  # 提升到 T2 (因為被訪問第二次了)
                 elif page in T2:
                     T2.remove(page)
-                    T2.append(page)  # 更新 recency
+                    T2.append(page)  # 更新 recency (移到最後)
+                # 更新 dirty bit
                 if is_write:
                     dirty[page] = True
                 continue
 
-            # 命中在 B1
+            # Case 2: 命中在 B1，表示 page 只被使用一次就 pop 掉了，所以調整 p 的大小 (增加 p)
             if page in B1:
+                # 調整 p: 增加 T1 的目標大小 (因為 B1 命中說明應該保留更多「只訪問一次」的頁面)
                 self.p = min(self.p + max(1, len(B2) // max(1, len(B1))), self.frames)
+                # 淘汰一個頁面來騰出空間
                 replace(page)
+                # 從 B1 移除並加入 T2 (因為現在是第二次訪問了)
                 B1.remove(page)
                 T2.append(page)
+                # 設置 dirty bit (這是新載入的頁面)
                 if is_write:
                     dirty[page] = True
+                # 這是 Page Fault (頁面不在實際內存中)
                 self.faults += 1
                 self.interrupts += 1
                 continue
 
-            # 命中在 B2
+            # Case 3: 命中在 B2，表示 page 曾經被多次使用，但還是被 pop，所以要調整 p 的大小 (減少 p)
             if page in B2:
+                # 調整 p: 減少 T1 的目標大小 (因為 B2 命中說明應該保留更多「頻繁訪問」的頁面)
                 self.p = max(self.p - max(1, len(B1) // max(1, len(B2))), 0)
+                # 淘汰一個頁面來騰出空間
                 replace(page)
+                # 從 B2 移除並加入 T2 (重新進入頻繁訪問區)
                 B2.remove(page)
                 T2.append(page)
+                # 設置 dirty bit (這是新載入的頁面)
                 if is_write:
                     dirty[page] = True
+                # 這是 Page Fault (頁面不在實際內存中)
                 self.faults += 1
                 self.interrupts += 1
                 continue
 
-            # 完全不在 (Page Fault)
+            # Case 4: 不在 T1, T2, B1, B2 中 (Page Fault - 完全未命中)
             self.faults += 1
             self.interrupts += 1
 
-            if len(T1) + len(T2) == self.frames:
-                replace(page)
+            # Case 4-A: |T1| + |B1| = c (frames)
+            # 當 T1 和 B1 的總大小已達到 frames 的大小，但 T2 和 B2 還有空間（因為總共可以有 2c 個頁面追蹤），表示此時正在大量使用「只訪問一次」的頁面
+            if len(T1) + len(B1) == self.frames:
+                if len(T1) < self.frames:
+                    # 如果 T1 沒滿，表示有太多使用一下子就被 pop 掉的頁面 => 從 B1 刪除 LRU 頁面，並用 replace 騰出實際的空間
+                    B1.pop(0)
+                    # 只有當 T1+T2 已滿時才需要 replace
+                    if len(T1) + len(T2) >= self.frames:
+                        replace(page)
+                else:
+                    # if |T1| = c, 表示 T1 滿了，B1 是空的 => 不需要執行 Replace，直接從 T1 刪除 LRU 並添加到 B1
+                    removed = T1.pop(0)
+                    # 如果被移除的頁面是 dirty，需要寫回
+                    if removed in dirty and dirty[removed]:
+                        self.writes += 1
+                        self.interrupts += 1
+                    # 清除 dirty 狀態 (使用 pop 避免 KeyError)
+                    dirty.pop(removed, None)
+                    B1.append(removed)
 
-            if len(T1) + len(T2) < self.frames:
-                T1.append(page)
+            # Case 4-B: |T1| + |B1| < c
+            # T1 + B1 的總和還沒達到 c，但 |T1| + |T2| + |B1| + |B2| 可能已經達到 2c (2frames)
             else:
-                # 若 frame 已滿，由 replace() 決定
-                T1.append(page)
+                total_size = len(T1) + len(T2) + len(B1) + len(B2)
+                if total_size >= 2 * self.frames:
+                    # 若|T1| + |T2| + |B1| + |B2| 已經達到 2c，從 B2 刪除 LRU 頁面
+                    if B2:
+                        B2.pop(0)
+                # 只有當 T1+T2 已滿時才需要 replace
+                if len(T1) + len(T2) >= self.frames:
+                    replace(page)
 
+            # 最後將新頁面加入 T1 (因為是第一次訪問)
+            T1.append(page)
+
+            # 維護 dirty bit (新頁面根據是否是寫操作來設置)
             if is_write:
                 dirty[page] = True
 
         print(
-            f"      Faults: {self.faults}, Interrupts: {self.interrupts}, Writes: {self.writes}"
+            f"    Faults: {self.faults}, Interrupts: {self.interrupts}, Writes: {self.writes}"
         )
         return self.faults, self.interrupts, self.writes
