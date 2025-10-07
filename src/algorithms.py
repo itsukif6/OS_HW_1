@@ -1,16 +1,13 @@
 # algorithms.py
-"""
-分頁置換演算法實作
-包含 FIFO, Optimal, Additional-reference-bits, 自訂 (TwoZone)
-"""
-
-
 class PageReplacementAlgorithm:
-    """分頁置換演算法的基礎類別"""
+    """
+    分頁置換演算法實作
+    包含 FIFO, Optimal, Additional-reference-bits, 自訂 (ARC)
+    """
 
     def __init__(self, frames):
         """
-        初始化演算法
+        初始化
 
         參數:
             frames: 可用的頁框數量

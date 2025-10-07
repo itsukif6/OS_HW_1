@@ -1,16 +1,15 @@
 # main.py
-"""
-主程式
-整合所有模組並執行實驗
-"""
-
-
 from algorithms import FIFO, Optimal, ReferenceBits, ARC
 from reference_generator import ReferenceGenerator
 from simulator import Simulator
 
 
 def main():
+    """
+    主程式
+    整合所有模組並執行實驗
+    """
+
     print("分頁置換演算法模擬器")
     print("=" * 50)
 
@@ -18,13 +17,14 @@ def main():
     print("\n生成參考字串...")
     generator = ReferenceGenerator()
 
+    # 要測試的參考字串
     references = {
         "Random": generator.generate_random(),
         "Locality": generator.generate_locality(),
-        "Zipf": generator.generate_zipf()
+        "Zipf": generator.generate_zipf(),
     }
 
-    # 定義要測試的演算法
+    # 要測試的演算法
     algorithms = {
         "FIFO": FIFO,
         "Optimal": Optimal,
