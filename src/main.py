@@ -21,7 +21,7 @@ def main():
     references = {
         "Random": generator.generate_random(),
         "Locality": generator.generate_locality(),
-        "Mixed": generator.generate_mixed(),
+        "Zipf": generator.generate_zipf()
     }
 
     # 定義要測試的演算法
